@@ -152,6 +152,11 @@ def read_byte(ea):
   byte = ord(byte) 
   return byte
 
+def read_word(ea):
+  bytestr = read_bytes_slowly(ea, ea + 2)
+  word = struct.unpack("<L", bytestr)[0]
+  return word
+
 def read_dword(ea):
   bytestr = read_bytes_slowly(ea, ea + 4)
   dword = struct.unpack("<L", bytestr)[0]
@@ -161,6 +166,33 @@ def read_qword(ea):
   bytestr = read_bytes_slowly(ea, ea + 8)
   qword = struct.unpack("<Q", bytestr)[0]
   return qword
+
+def read_leb128(ea, signed):
+  """ Read LEB128 encoded data
+  """
+  val = 0
+  shift = 0
+  while True:
+    byte = idc.Byte(ea)
+    val |= (byte & 0x7F) << shift
+    shift += 7
+    ea += 1
+    if (byte & 0x80) == 0:
+      break
+
+    if shift > 64:
+      DEBUG("Bad leb128 encoding at {0:x}".format(ea - shift/7))
+      return idc.BADADDR
+
+  if signed and (byte & 0x40):
+    val -= (1<<shift)
+  return val, ea
+
+def read_pointer(ea):
+  if _INFO.is_64bit():
+    return read_qword(ea)
+  else:
+    return read_dword(ea)
 
 def instruction_personality(arg):
   global PERSONALITIES
@@ -302,6 +334,29 @@ def is_external_segment(ea):
   _NOT_EXTERNAL_SEGMENTS.add(seg_ea)
   return False
 
+def is_constructor_segment(ea):
+  """Returns `True` if the segment containing `ea` belongs to global constructor section"""
+  seg_ea = idc.SegStart(ea)
+  seg_name = idc.SegName(seg_ea).lower()
+  if seg_name in [".init_array", ".ctor"]:
+    return True
+  return False
+
+def is_destructor_segment(ea):
+  """Returns `True` if the segment containing `ea` belongs to global destructor section"""
+  seg_ea = idc.SegStart(ea)
+  seg_name = idc.SegName(seg_ea).lower()
+  if seg_name in [".fini_array", ".dtor"]:
+    return True
+  return False
+
+def get_destructor_segment():
+  """Returns the start address of the global destructor section"""
+  for seg_ea in idautils.Segments():
+    seg_name = idc.SegName(seg_ea).lower()
+    if seg_name in [".fini_array", ".dtor"]:
+      return seg_ea;
+
 def is_internal_code(ea):
   if is_invalid_ea(ea):
     return False
@@ -344,10 +399,11 @@ _FORCED_NAMES = {}
 # conflict with register names, so we have the backup path of splatting things
 # into a dictionary.
 def set_symbol_name(ea, name):
+  global _FORCED_NAMES
+
   flags = idaapi.SN_PUBLIC | idaapi.SN_NOCHECK | idaapi.SN_NON_AUTO | idaapi.SN_NOWARN
-  if not idc.MakeNameEx(ea, name, flags):
-    global _FORCED_NAMES
-    _FORCED_NAMES[ea] = name
+  _FORCED_NAMES[ea] = name
+  idc.MakeNameEx(ea, name, flags)  
 
 # Tries to get the name of a symbol.
 def get_symbol_name(from_ea, ea=None, allow_dummy=False):
@@ -486,7 +542,7 @@ def _xref_generator(ea, get_first, get_next):
     yield target_ea
     target_ea = get_next(ea, target_ea)
 
-def _drefs_from(ea, only_one=False, check_fixup=True):
+def drefs_from(ea, only_one=False, check_fixup=True):
   seen = False
   has_one = only_one
   fixup_ea = idc.BADADDR
@@ -514,7 +570,7 @@ def _drefs_from(ea, only_one=False, check_fixup=True):
       if seen:
         return
 
-def _crefs_from(ea, only_one=False, check_fixup=True):
+def crefs_from(ea, only_one=False, check_fixup=True):
   flags = idc.GetFlags(ea)
   if not idc.isCode(flags):
     return
@@ -558,14 +614,14 @@ def xrefs_from(ea, only_one=False):
   if has_one and _stop_looking_for_xrefs(ea):
     return
 
-  for target_ea in _drefs_from(ea, only_one, check_fixup=False):
+  for target_ea in drefs_from(ea, only_one, check_fixup=False):
     if target_ea != fixup_ea:
       seen = only_one
       yield target_ea
       if seen:
         return
 
-  for target_ea in _crefs_from(ea, only_one, check_fixup=False):
+  for target_ea in crefs_from(ea, only_one, check_fixup=False):
     if target_ea != fixup_ea:
       seen = only_one
       yield target_ea
@@ -601,8 +657,8 @@ def _reference_checker(ea, dref_finder=_IGNORE_DREF, cref_finder=_IGNORE_CREF):
 def remove_all_refs(ea):
   """Remove all references to something."""
   assert False
-  dref_eas = list(_drefs_from(ea))
-  cref_eas = list(_crefs_from(ea))
+  dref_eas = list(drefs_from(ea))
+  cref_eas = list(crefs_from(ea))
 
   for ref_ea in dref_eas:
     idaapi.del_dref(ea, ref_ea)
@@ -660,7 +716,7 @@ def is_data_reference(ea):
   if is_invalid_ea(ea):
     return False
 
-  for target_ea in _drefs_from(ea):
+  for target_ea in drefs_from(ea):
     return True
 
   return is_runtime_external_data_reference(ea)

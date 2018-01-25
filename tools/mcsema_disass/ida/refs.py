@@ -165,6 +165,67 @@ _HAS_NO_REFS = set()
 _NO_REFS = tuple()
 _ENABLE_CACHING = False
 _BAD_ARM_REF_OFF = (idc.BADADDR, 0)
+_NOT_A_REF = set()
+
+# Remove a reference from `from_ea` to `to_ea`.
+def remove_instruction_reference(from_ea, to_ea):
+  global _REFS, _NOT_A_REF
+
+  _NOT_A_REF.add((from_ea, to_ea))
+
+  try:
+    idaapi.del_dref(from_ea, to_ea)
+    idaapi.del_cref(from_ea, to_ea, False)
+    idaapi.del_cref(from_ea, to_ea, True)
+  except:
+    pass
+
+  if not _ENABLE_CACHING or from_ea not in _REFS:
+    return
+
+  new_refs = []
+  found = False
+  for old_ref in _REFS[from_ea]:
+    if old_ref.ea != to_ea:
+      new_refs.append(old_ref)
+    else:
+      found = True
+
+  if found:
+    _REFS[from_ea] = tuple(new_refs)
+
+def _get_arm_ref_candidate(mask, op_val, op_str, all_refs):
+  global _BAD_ARM_REF_OFF
+
+  try:
+    op_name = op_str.split("@")[0][1:]  # `#asc_400E5C@PAGE` -> `asc_400E5C`.
+    ref_ea = idc.LocByName(op_name)
+    if (ref_ea & mask) == op_val:
+      return ref_ea, mask
+  except:
+    pass
+
+  # NOTE(pag): We deal with candidates because it's possible that this
+  #            instruction will have multiple references. In the case of
+  #            `@PAGE`-based offsets, it's problematic when the wrong base
+  #            is matched, because it really throws off the C++ side of things
+  #            because the arrangement of the lifted data being on the same
+  #            page is not guaranteed.
+
+  candidates = set()
+  for ref_ea in all_refs:
+    if (ref_ea & mask) == op_val:
+      candidates.add(ref_ea)
+      return ref_ea, mask
+
+  if len(candidates):
+    for candidate_ea in candidates:
+      if candidate_ea == op_val:
+        return candidate_ea, mask
+
+    return candidates.pop(), mask
+
+  return _BAD_ARM_REF_OFF
 
 # Try to handle `@PAGE` and `@PAGEOFF` references, resolving them to their
 # 'intended' address.
@@ -181,18 +242,13 @@ def _try_get_arm_ref_addr(inst, op, op_val, all_refs):
   op_str = idc.GetOpnd(inst.ea, op.n)
 
   if '@PAGEOFF' in op_str:
-    mask = 0x0fff
-    for ref_ea in all_refs:
-      if (ref_ea & mask) == op_val:
-        return ref_ea, mask
-    DEBUG("Found @PAGEOFF-based reference at {:x} but could not match it in all_refs".format(inst.ea));
+    return _get_arm_ref_candidate(4095, op_val, op_str, all_refs)
 
   elif '@PAGE' in op_str:
-    mask = 0x0fffff000
-    for ref_ea in all_refs:
-      if (ref_ea & mask) == op_val:
-        return ref_ea, mask
-    DEBUG("Found @PAGE-based reference at {:x} but could not match it in all_refs".format(inst.ea));
+    return _get_arm_ref_candidate(-4096L, op_val, op_str, all_refs)
+
+  elif not is_invalid_ea(op_val) and inst.get_canon_mnem().lower() == "adr":
+    return op_val, 0
 
   return _BAD_ARM_REF_OFF
 
@@ -202,7 +258,7 @@ def _is_ea_into_bad_code(ea, binary_is_pie):
     return False
 
   import flow  # Circular dependency!
-  term_inst = flow.find_linear_terminator(ea)
+  term_inst, _ = flow.find_linear_terminator(ea)
   if not term_inst:
     return True
 
@@ -224,6 +280,7 @@ def _get_ref_candidate(inst, op, all_refs, binary_is_pie):
   ref = None
   addr_val = idc.BADADDR
   mask = 0
+  is_memop = idc.o_mem == op.type
 
   if idc.o_imm == op.type:
     addr_val = op.value
@@ -237,8 +294,12 @@ def _get_ref_candidate(inst, op, all_refs, binary_is_pie):
   #              will avoid these awkward `if IS_ARM` and the comments about
   #              x86 / amd64 stuff.
   if IS_ARM:
+    old_addr_val = addr_val
     addr_val, mask = _try_get_arm_ref_addr(inst, op, addr_val, all_refs)
-  
+
+  info = idaapi.refinfo_t()
+  has_ref_info = idaapi.get_refinfo(inst.ea, op.n, info) == 1
+
   if is_invalid_ea(addr_val):
     
     # The `addr_val` that we get might actually be a value that is relative to
@@ -249,14 +310,17 @@ def _get_ref_candidate(inst, op, all_refs, binary_is_pie):
     # And we'd get `addr_val` as `0x22FC`, which isn't a valid EA. Here we
     # detect this and fixup the `addr_val` to include the relative base
     # of `0x140000000`.
-    info = idaapi.refinfo_t()
-    if idaapi.get_refinfo(inst.ea, op.n, info) and info.is_rvaoff():
+    if has_ref_info and info.is_rvaoff():
       addr_val += info.base
       if is_invalid_ea(addr_val):
         return None
     else:
       return None
   
+  # The address is a direct memory reference.
+  if addr_val not in all_refs and is_memop:
+    all_refs.add(addr_val)
+
   if addr_val not in all_refs and is_head(addr_val):
     all_refs.add(addr_val)
 
@@ -297,8 +361,8 @@ def _get_ref_candidate(inst, op, all_refs, binary_is_pie):
         inst.ea, addr_val))
 
   if addr_val not in all_refs:
-    DEBUG("POSSIBLE ERROR: Not adding reference from {:x} to {:x}".format(
-        inst.ea, addr_val))
+    DEBUG("POSSIBLE ERROR: Not adding reference from {:x} to {:x}; candidates were {}; operand type is {}, has ref info is {}".format(
+        inst.ea, addr_val, " ".join("{:x}".format(r) for r in all_refs), op.type, has_ref_info))
     _POSSIBLE_REFS.add(addr_val)
     return None
 
@@ -323,29 +387,7 @@ def memop_is_actually_displacement(inst):
 
 # Return the set of all references from `ea` to anything.
 def get_all_references_from(ea):
-  all_refs = set()
-  for ref_ea in idautils.DataRefsFrom(ea):
-    if not is_invalid_ea(ref_ea):
-      all_refs.add(ref_ea)
-    else:
-      #DEBUG("Found an invalid ref from {:x} to {:x}".format(ea, ref_ea))
-      pass
-
-  for ref_ea in idautils.CodeRefsFrom(ea, 0):
-    if not is_invalid_ea(ref_ea):
-      all_refs.add(ref_ea)
-    else:
-      #DEBUG("We found an invalid ref from {:x} to {:x}".format(ea, ref_ea))
-      pass
-
-  for ref_ea in idautils.CodeRefsFrom(ea, 1):
-    if not is_invalid_ea(ref_ea):
-      all_refs.add(ref_ea)
-    else:
-      #DEBUG("We found an invalid ref from {:x} to {:x}".format(ea, ref_ea))
-      pass
-
-  return all_refs
+  return set(xrefs_from(ea))
 
 # This is a real hack. It can take a few tries to really find references, so
 # we'll only enable reference caching after we do some processing of segments.
@@ -358,7 +400,7 @@ def enable_reference_caching():
 
 # Get a list of references from an instruction.
 def get_instruction_references(arg, binary_is_pie=False):
-  global _ENABLE_CACHING
+  global _ENABLE_CACHING, _NOT_A_REF
 
   inst = arg
   if isinstance(arg, (int, long)):
@@ -382,7 +424,6 @@ def get_instruction_references(arg, binary_is_pie=False):
       all_refs.add(targ_ea)
       ref = Reference(targ_ea, ea - inst.ea)
       offset_to_ref[ref.offset] = ref
-
 
   refs = []
   for i, op in enumerate(inst.Operands):
@@ -463,7 +504,8 @@ def get_instruction_references(arg, binary_is_pie=False):
     # Note: idc.o_phrase is ignored because it doesn't have a displacement,
     #       and so can't reference a specific symbol.
 
-    refs.append(ref)
+    if (inst.ea, ref.ea) not in _NOT_A_REF:
+      refs.append(ref)
 
   for ref in refs:
     assert not is_invalid_ea(ref.ea)

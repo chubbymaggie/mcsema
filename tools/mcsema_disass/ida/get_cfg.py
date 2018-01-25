@@ -33,6 +33,7 @@ from flow import *
 from refs import *
 from segment import *
 from collect_variable import *
+from exception import *
 
 #hack for IDAPython to see google protobuf lib
 if os.path.isdir('/usr/lib/python2.7/dist-packages'):
@@ -129,13 +130,13 @@ def demangled_name(name):
     if dname and len(dname) and "::" not in dname:
       dname = dname.split("(")[0]
       dname = dname.split(" ")[-1]
-      if dname:
+      if re.match(r"^[a-zA-Z0-9_]+$", dname):
         return dname
     return name
   except:
     return name
 
-def get_true_external_name(fn):
+def get_true_external_name(fn, demangle=True):
   """Tries to get the 'true' name of `fn`. This removes things like
   ELF-versioning from symbols."""
   if not fn:
@@ -153,7 +154,8 @@ def get_true_external_name(fn):
 
   # Try to demangle the name, but don't do it if looks like there's a C++
   # namespace.
-  fn = demangled_name(fn)
+  if demangle:
+    fn = demangled_name(fn)
 
   # TODO(pag): Is this a macOS or Windows thing?
   if not is_linked_ELF_program() and fn[0] == '_':
@@ -735,7 +737,10 @@ def recover_basic_block(M, F, block_ea):
   I = None
   for inst_ea in inst_eas:
     I = recover_instruction(M, B, inst_ea)
-
+    if I:
+      # Get the landing pad associated with the instructions;
+      # 0 if no landing pad associated
+      I.lp_ea = get_exception_landingpad(F, inst_ea)
 
   DEBUG_PUSH()
   if I and I.local_noreturn:
@@ -768,37 +773,6 @@ def analyze_jump_table_targets(inst, new_eas, new_func_eas):
           table.table_ea, entry_addr, entry_target))
       new_eas.add(entry_target)
 
-def recover_variables(F, func_ea, BB):
-  '''
-  Collects stack variable data from all functions in the database.
-  '''
-  functions = list()
-  if is_code_by_flags(func_ea):
-    f_ea = idc.GetFunctionAttr(func_ea, idc.FUNCATTR_START)
-    f_vars = collect_function_vars(func_ea, BB)
-    functions.append({"ea":f_ea, "name":idc.Name(func_ea), "stackArgs":f_vars})
-
-  DEBUG("{0}".format(pprint.pformat(functions)))
-  
-  for offset in f_vars.keys():
-    if f_vars[offset]["safe"] is False:
-        continue
-
-    var = F.stack_vars.add()
-    var.sp_offset = offset
-    var.name = f_vars[offset]["name"]
-    var.size = f_vars[offset]["size"]
-    # add refs...
-    for i in f_vars[offset]["writes"]:
-      r = var.ref_eas.add()
-      r.inst_ea = i["ea"]
-      r.offset = i["offset"]
-
-    for i in f_vars[offset]["reads"]:
-      r = var.ref_eas.add()
-      r.inst_ea = i["ea"]
-      r.offset = i["offset"]
-
 _RECOVERED_FUNCS = set()
 
 def recover_function(M, func_ea, new_func_eas, entrypoints):
@@ -825,6 +799,8 @@ def recover_function(M, func_ea, new_func_eas, entrypoints):
     DEBUG("Recovering {:x}".format(func_ea))
 
   DEBUG_PUSH()
+  # Update the protobuf with the recovered eh_frame entries
+  recover_exception_entries(F, func_ea)
   blockset, term_insts = analyse_subroutine(func_ea, PIE_MODE)
 
   for term_inst in term_insts:
@@ -1040,10 +1016,72 @@ def recover_regions(M, exported_vars, global_vars=[]):
     seg_name = idc.SegName(seg_ea)
     seg_names[seg_ea] = seg_name
 
-    if not is_external_segment_by_flags(seg_ea) or \
-       segment_contains_external_function_pointers(seg_ea):
+    if (not is_external_segment_by_flags(seg_ea) or \
+        segment_contains_external_function_pointers(seg_ea)) and \
+        not (is_constructor_segment(seg_ea) or is_destructor_segment(seg_ea)):
       seg_parts[seg_ea].add(seg_ea)
       seg_parts[seg_ea].add(idc.SegEnd(seg_ea))
+
+    # Fix for an important feature - static storage allocation of the objects in C++, where
+    # the constructor gets invoked before the main and it typically calls the 'init/__libc_csu_init' function.
+    #
+    # The function iterate over the array conatined in .init_array initializing the global constructor/destructor
+    # function pointers using the symbol `off_201D70` and `off_201D80` as the array bounds as shown below. These
+    # symbols falls in section `.init_array` and `.fini_array` correspondingly.
+    #
+    # .init_array:0000000000201D70 ; ELF Initialization Function Table
+    # .init_array:0000000000201D70 ; ===========================================================================
+    # .init_array:0000000000201D70 ; Segment type: Pure data
+    # .init_array:0000000000201D70 _init_array     segment para public 'DATA' use64
+    # .init_array:0000000000201D70                 assume cs:_init_array
+    # .init_array:0000000000201D70                 ;org 201D70h
+    # .init_array:0000000000201D70 off_201D70      dq offset sub_C40
+    # .init_array:0000000000201D70
+    # .init_array:0000000000201D78                 dq offset sub_10E5
+    # .init_array:0000000000201D78 _init_array     ends
+    #
+    # .fini_array:0000000000201D80 ; ELF Termination Function Table
+    # .fini_array:0000000000201D80 ; ===========================================================================
+    # .fini_array:0000000000201D80 ; Segment type: Pure data
+    # .fini_array:0000000000201D80 _fini_array     segment para public 'DATA' use64
+    # .fini_array:0000000000201D80                 assume cs:_fini_array
+    # .fini_array:0000000000201D80                 ;org 201D80h
+    # .fini_array:0000000000201D80 off_201D80      dq offset sub_C00
+    # .fini_array:0000000000201D80 _fini_array     ends
+    #
+    # .text:0000000000001160 ; void init(void)
+    # .text:0000000000001160                 push    r15
+    # .text:0000000000001162                 mov     r15d, edi
+    # .text:0000000000001165                 push    r14
+    # .text:0000000000001167                 mov     r14, rsi
+    # .text:000000000000116A                 push    r13
+    # .text:000000000000116C                 mov     r13, rdx
+    # .text:000000000000116F                 push    r12
+    # .text:0000000000001171                 lea     r12, off_201D70
+    # .text:0000000000001178                 push    rbp
+    # .text:0000000000001179                 lea     rbp, off_201D80
+    # .text:0000000000001180                 push    rbx
+    # .text:0000000000001181                 sub     rbp, r12
+    # .text:0000000000001184                 xor     ebx, ebx
+    # .text:0000000000001186                 sar     rbp, 3
+    # .text:000000000000118A                 sub     rsp, 8
+    # .text:000000000000118E                 call    _init_proc
+    # ...
+    # Extracting these sections as different LLVM GlobalVariable will not guarantee the adjacency placement in
+    # recompiled binary. Hence it should be lifted as one LLVM GlobalVariable if they are adjacent.
+
+    if is_constructor_segment(seg_ea):
+      seg_parts[seg_ea].add(seg_ea)
+      end_ea =  idc.SegEnd(seg_ea)
+      if is_destructor_segment(end_ea):
+        seg_parts[seg_ea].add(idc.SegEnd(end_ea))
+        DEBUG("WARNING: Global constructor and destructor sections are adjacent!")
+      else:
+        seg_parts[seg_ea].add(end_ea)
+        fini_ea = get_destructor_segment()
+        if fini_ea:
+          seg_parts[fini_ea].add(fini_ea)
+          seg_parts[fini_ea].add(idc.SegEnd(fini_ea))
 
   # Treat analysis-identified global variables as segment begin/end points.
   for var_name, begin_ea, end_ea in global_vars:
@@ -1257,7 +1295,9 @@ def identify_external_symbols():
           del EMAP[target_name]
 
     elif is_external_segment_by_flags(ea) or is_runtime_external_data_reference(ea):
-      extern_name = get_true_external_name(name)
+      # idc.Demangle (...) gives incorrect name for the external data objects
+      # only de-mangle the name of the external functions
+      extern_name = get_true_external_name(name, demangle=is_code(ea))
 
       if extern_name in EMAP_DATA:
         DEBUG("Variable at {:x} is the external {}".format(ea, extern_name))
@@ -1279,7 +1319,7 @@ def identify_external_symbols():
         comment = idc.GetCommentEx(ea, 0) or ""
         for comment_line in comment.split("\n"):
           comment_line = comment_line.replace(";", "").strip()
-          found_name = get_true_external_name(comment_line)
+          found_name = get_true_external_name(comment_line, demangle=is_code(ea))
           if found_name in EMAP_DATA:
             extern_name = found_name
             break
@@ -1324,6 +1364,43 @@ def identify_program_entrypoints(func_eas):
   DEBUG_POP()
   return exported_funcs, exported_vars
 
+def find_main_in_ELF_file():
+  """Tries to automatically find the `main` function if we haven't found it
+  yet. IDA recognizes the pattern of `_start` calling `__libc_start_main` in
+  ELF binaries, where one of the parameters is the `main` function. IDA will
+  helpfully comment it as such."""
+
+  start_ea = idc.LocByName("_start")
+  if is_invalid_ea(start_ea):
+    start_ea = idc.LocByName("start")
+    if is_invalid_ea(start_ea):
+      return idc.BADADDR
+
+  for begin_ea, end_ea in idautils.Chunks(start_ea):
+    for inst_ea in Heads(begin_ea, end_ea):
+      comment = idc.GetCommentEx(inst_ea, 0)
+      if comment and "main" in comment:
+        for main_ea in xrefs_from(inst_ea):
+          if not is_code(main_ea):
+            continue
+
+          # Sometimes the `main` function isn't identified as code. This comes
+          # up when there are some alignment bytes in front of `main`.
+          try_mark_as_code(main_ea)
+          if is_code_by_flags(main_ea):
+            try_mark_as_function(main_ea)
+
+          main = idaapi.get_func(main_ea)
+          if not main:
+            continue
+
+          if main and main.startEA == main_ea:
+            set_symbol_name(main_ea, "main")
+            DEBUG("Found main at {:x}".format(main_ea))
+            return main_ea
+
+  return idc.BADADDR
+
 def recover_module(entrypoint, gvar_infile = None):
   global EMAP
   global EXTERNAL_FUNCS_TO_RECOVER
@@ -1333,7 +1410,17 @@ def recover_module(entrypoint, gvar_infile = None):
   M.name = idc.GetInputFile().format('utf-8')
   DEBUG("Recovering module {}".format(M.name))
 
+  entry_ea = idc.LocByName(args.entrypoint)
+
+  # If the entrypoint is `main`, then we'll try to find `main` via another
+  # means.
+  if is_invalid_ea(entry_ea):
+    if "main" == args.entrypoint and IS_ELF:
+      entry_ea = find_main_in_ELF_file()
+
+  recover_exception_table()
   process_segments(PIE_MODE)
+
   func_eas = find_default_function_heads()
 
   recovered_fns = 0
@@ -1342,10 +1429,11 @@ def recover_module(entrypoint, gvar_infile = None):
   identify_external_symbols()
   
   exported_funcs, exported_vars = identify_program_entrypoints(func_eas)
-  entry_ea = idc.LocByName(args.entrypoint)
+
   if is_invalid_ea(entry_ea):
     DEBUG("ERROR: Could not find entrypoint {}".format(args.entrypoint))
   else:
+    func_eas.add(entry_ea)
     exported_funcs.add(entry_ea)
 
   # Process and recover functions. 
@@ -1389,39 +1477,6 @@ def recover_module(entrypoint, gvar_infile = None):
 
   DEBUG("Recovered {0} functions.".format(recovered_fns))
   return M
-
-def parseTypeString(typestr, ea):
-
-  if "__stdcall" in typestr:
-    conv = CFG_pb2.ExternalFunction.CalleeCleanup
-  elif "__cdecl" in typestr:
-    conv = CFG_pb2.ExternalFunction.CallerCleanup
-  elif "__fastcall" in typestr:
-    conv = CFG_pb2.ExternalFunction.FastCall
-  elif "__usercall" in typestr:
-    # do not handle this for now
-    return (0, CFG_pb2.ExternalFunction.CalleeCleanup, "N")
-  else:
-    raise Exception("Could not parse function type:"+typestr)
-
-  fn = idaapi.get_func(ea)
-  if fn is None:
-    raise Exception("Could not get function args for: {0:x}".format(ea))
-  args = fn.argsize / 4
-
-  ret = 'N'
-
-  return args, conv, ret
-
-def getAllExports():
-  entrypoints = idautils.Entries()
-  to_recover = set()
-  # recover every entry point
-  for ep_tuple in entrypoints:
-    (index, ordinal, ea, name) = ep_tuple
-    to_recover.add(name)
-
-  return to_recover 
 
 if __name__ == "__main__":
 
